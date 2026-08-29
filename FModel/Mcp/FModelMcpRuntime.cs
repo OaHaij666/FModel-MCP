@@ -6,6 +6,7 @@ using System.Windows;
 using CUE4Parse.FileProvider.Objects;
 using FModel.Services;
 using FModel.Settings;
+using FModel.Framework;
 using FModel.ViewModels;
 using Newtonsoft.Json;
 
@@ -16,6 +17,7 @@ public sealed class FModelMcpRuntime : IAsyncDisposable
 {
     private readonly SemaphoreSlim _initialization = new(1, 1);
     private readonly SemaphoreSlim _operations = new(1, 1);
+    private bool _settingsLoaded;
     private ApplicationViewModel? _application;
     public bool IsInitialized => _application != null;
 
@@ -59,13 +61,21 @@ public sealed class FModelMcpRuntime : IAsyncDisposable
             if (Application.Current == null)
                 throw new InvalidOperationException("FModel MCP requires a Windows application dispatcher.");
 
-            _application = await Application.Current.Dispatcher.InvokeAsync(() => ApplicationService.ApplicationView);
-            var cue = _application.CUE4Parse;
-            await Task.WhenAll(ApplicationViewModel.InitOodle(), ApplicationViewModel.InitZlib());
-            await cue.Initialize();
-            await _application.AesManager.InitAes();
-            await _application.UpdateProvider(true);
-            await Task.WhenAll(cue.InitMappings(), ApplicationViewModel.InitDetex(), cue.VerifyConsoleVariables(), cue.VerifyOnDemandArchives());
+            await Application.Current.Dispatcher.InvokeAsync(async () =>
+            {
+                _application = ApplicationService.ApplicationView;
+                var cue = _application.CUE4Parse;
+                await Task.WhenAll(ApplicationViewModel.InitOodle(), ApplicationViewModel.InitZlib());
+                await cue.Initialize();
+                await _application.AesManager.InitAes();
+                await _application.UpdateProvider(true);
+                await Task.WhenAll(cue.InitMappings(), ApplicationViewModel.InitDetex(), cue.VerifyConsoleVariables(), cue.VerifyOnDemandArchives());
+            }).Task.Unwrap();
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"FModel MCP provider initialization failed: {exception.GetType().FullName}");
+            throw;
         }
         finally
         {
@@ -73,7 +83,7 @@ public sealed class FModelMcpRuntime : IAsyncDisposable
         }
     }
 
-    private static void InitializeSettings()
+    private void InitializeSettings()
     {
         LoadSettings();
         if (UserSettings.Default.CurrentDir != null) return;
@@ -82,12 +92,13 @@ public sealed class FModelMcpRuntime : IAsyncDisposable
         UserSettings.Default.CurrentDir = directorySettings;
     }
 
-    private static void LoadSettings()
+    private void LoadSettings()
     {
-        if (UserSettings.Default.OutputDirectory is { Length: > 0 }) return;
+        if (_settingsLoaded) return;
         try
         {
-            UserSettings.Default = JsonConvert.DeserializeObject<UserSettings>(File.ReadAllText(UserSettings.FilePath)) ?? new UserSettings();
+            UserSettings.Default = JsonConvert.DeserializeObject<UserSettings>(
+                File.ReadAllText(UserSettings.FilePath), JsonNetSerializer.SerializerSettings) ?? new UserSettings();
         }
         catch
         {
@@ -105,6 +116,7 @@ public sealed class FModelMcpRuntime : IAsyncDisposable
         UserSettings.Default.ModelDirectory = DefaultDirectory(UserSettings.Default.ModelDirectory, "Exports");
         Directory.CreateDirectory(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "FModel"));
         Directory.CreateDirectory(Path.Combine(UserSettings.Default.OutputDirectory, "Logs"));
+        _settingsLoaded = true;
     }
 
     private static string DefaultDirectory(string? value, string name)
