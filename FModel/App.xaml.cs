@@ -5,6 +5,7 @@ using System;
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Threading;
 using CUE4Parse;
@@ -29,6 +30,9 @@ public partial class App
     [DllImport("kernel32.dll")]
     private static extern bool AttachConsole(int dwProcessId);
 
+    [DllImport("kernel32.dll")]
+    private static extern bool FreeConsole();
+
     [DllImport("winbrand.dll", CharSet = CharSet.Unicode)]
     [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
     static extern string BrandingFormatString(string format);
@@ -38,7 +42,21 @@ public partial class App
 #if DEBUG
         AttachConsole(-1);
 #endif
+        var isMcpHost = e.Args.Contains("--mcp", StringComparer.OrdinalIgnoreCase);
+        if (!isMcpHost)
+            FreeConsole();
+        else
+        {
+            StartupUri = null;
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+        }
         base.OnStartup(e);
+
+        if (isMcpHost)
+        {
+            _ = RunMcpAsync(e.Args);
+            return;
+        }
 
         try
         {
@@ -145,7 +163,26 @@ public partial class App
 
         static bool IsConversionLibrary(LogEvent e) =>
             e.Properties.TryGetValue("SourceContext", out var sc) &&
-            sc.ToString().Contains("CUE4Parse_Conversion");
+                sc.ToString().Contains("CUE4Parse_Conversion");
+
+        MainWindow = new MainWindow();
+        MainWindow.Show();
+    }
+
+    private async Task RunMcpAsync(string[] args)
+    {
+        try
+        {
+            await Mcp.McpServerHost.RunAsync(args);
+        }
+        catch (Exception exception)
+        {
+            Log.Fatal(exception, "FModel MCP host stopped unexpectedly");
+        }
+        finally
+        {
+            Shutdown();
+        }
     }
 
     private void AppExit(object sender, ExitEventArgs e)

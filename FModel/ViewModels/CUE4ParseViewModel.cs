@@ -66,6 +66,7 @@ using CUE4Parse.UE4.Shaders;
 using CUE4Parse.UE4.Versions;
 using CUE4Parse.UE4.Wwise;
 using CUE4Parse.Utils;
+using CUE4Parse_Conversion;
 using CUE4Parse_Conversion.Exporters;
 using CUE4Parse_Conversion.Sounds;
 using EpicManifestParser;
@@ -93,6 +94,11 @@ namespace FModel.ViewModels;
 
 public class CUE4ParseViewModel : ViewModel
 {
+    /// <summary>
+    /// Optional non-UI export queue. The MCP host sets this for the duration of
+    /// a request so exporters do not depend on the Export Session window.
+    /// </summary>
+    public ExportSession? ExportSessionOverride { get; set; }
     private ThreadWorkerViewModel _threadWorkerView => ApplicationService.ThreadWorkerView;
     private ApiEndpointViewModel _apiEndpointView => ApplicationService.ApiEndpointView;
     private readonly Regex _fnLiveRegex = new(@"^FortniteGame[/\\]Content[/\\]Paks[/\\]",
@@ -1741,7 +1747,7 @@ public class CUE4ParseViewModel : ViewModel
     {
         try
         {
-            ExportSessionViewModel.Instance.Session.Add(export);
+            (ExportSessionOverride ?? ExportSessionViewModel.Instance.Session).Add(export);
         }
         catch (Exception e)
         {
@@ -1753,7 +1759,7 @@ public class CUE4ParseViewModel : ViewModel
     {
         try
         {
-            ExportSessionViewModel.Instance.Session.Add(new RawDataExporter(entry, Provider));
+            (ExportSessionOverride ?? ExportSessionViewModel.Instance.Session).Add(new RawDataExporter(entry, Provider));
         }
         catch (Exception e)
         {
