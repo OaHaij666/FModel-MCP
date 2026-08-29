@@ -14,7 +14,9 @@ internal static class Program
     {
         if (!args.Contains("--mcp", StringComparer.OrdinalIgnoreCase))
         {
-            new App().Run();
+            var guiApp = new App();
+            guiApp.InitializeComponent();
+            guiApp.Run();
             return;
         }
 
