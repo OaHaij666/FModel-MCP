@@ -1,4 +1,58 @@
-FModel - An Unreal Engine Archives Explorer in C#
+# FModel-MCP
+
+> A frozen FModel fork adapted for AI agents through Model Context Protocol (MCP).
+
+This repository is a purpose-built MCP variant of [4sval/FModel](https://github.com/4sval/FModel), pinned to the `aug-2026` upstream release line. It preserves the FModel GUI while exposing the same archive, configuration, asset inspection, preview, and export capabilities to MCP-compatible agents such as Codex.
+
+It is not an official FModel release and intentionally does not follow upstream's rapid update cadence.
+
+## Deliverables
+
+- `FModel.exe` — the normal FModel GUI. It also supports `FModel.exe --mcp` for a stdio MCP host.
+- `FModel.Mcp.exe` — dedicated self-contained Windows x64 stdio MCP server for agents.
+
+Both modes reuse FModel's existing game-directory profile, AES keys, mappings, and export defaults. MCP responses never return AES material.
+
+## Connect an agent (Codex)
+
+The agent-side installer is versioned in this repository:
+
+```powershell
+.\agents\codex\install-fmodel-mcp.ps1 -Executable "C:\path\to\FModel.Mcp.exe"
+```
+
+It registers a global `fmodel` stdio MCP server in Codex. To check the registration:
+
+```powershell
+codex mcp list
+```
+
+The server must be restarted after using configuration tools that change the active game profile, AES keys, or mappings.
+
+## MCP tools
+
+| Tool | Purpose |
+| --- | --- |
+| `fmodel_status` | Mounted archives, asset count, mappings and key readiness (no secrets). |
+| `fmodel_search_assets` | Text or regex search over mounted paths. |
+| `fmodel_get_asset_metadata` | Structured metadata for an asset. |
+| `fmodel_export_asset`, `fmodel_export_batch` | Export raw data, properties, textures, models, worlds, animations, audio, or code. Per-call export options are supported. |
+| `fmodel_render_preview`, `fmodel_open_asset` | Texture files or hidden-OpenGL model/world preview plus interchange export. |
+| `fmodel_list_game_versions`, `fmodel_configure_game` | Discover and configure game profile settings. |
+| `fmodel_set_aes_keys`, `fmodel_set_mappings` | Configure keys and mappings without returning secret values. |
+| `fmodel_get_export_options` | Inspect active defaults and allowed export enums, including `Gltf2` / GLB. |
+
+For example, an agent can search `Dalang`, choose the static-mesh `.uasset`, then call `fmodel_export_asset` with `kind: "models"` and `options: { "meshFormat": "Gltf2" }` to produce a `.glb` file.
+
+## Requirements and limitations
+
+- Windows x64 and .NET 10 are required for building. Published self-contained binaries do not need a separate .NET install.
+- Users must only configure game files, AES keys, and mappings they are authorized to access.
+- Model/world screenshots require a working local OpenGL/GPU driver. Failure to capture a screenshot does not prevent model/world export.
+- `FModel.Mcp.exe` serializes operations because the underlying FModel provider is mutable and WPF-bound.
+
+## Upstream FModel
+
 ------------------------------------------
 
 [![CI Status](https://img.shields.io/github/actions/workflow/status/4sval/FModel/qa.yml?label=CI)](https://github.com/4sval/FModel/actions)
