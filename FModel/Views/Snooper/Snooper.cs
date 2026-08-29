@@ -1,5 +1,6 @@
 using System;
 using System.ComponentModel;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
@@ -10,6 +11,7 @@ using OpenTK.Windowing.Common;
 using OpenTK.Windowing.Common.Input;
 using OpenTK.Windowing.Desktop;
 using OpenTK.Windowing.GraphicsLibraryFramework;
+using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Advanced;
 using SixLabors.ImageSharp.PixelFormats;
 using Application = System.Windows.Application;
@@ -24,6 +26,11 @@ public class Snooper : GameWindow
     private readonly SnimGui _gui;
 
     private bool _init;
+    private string _capturePath;
+    private int _captureFrames;
+    private int _captureWidth;
+    private int _captureHeight;
+    public string LastCaptureError { get; private set; }
 
     public Snooper(GameWindowSettings gwSettings, NativeWindowSettings nwSettings) : base(gwSettings, nwSettings)
     {
@@ -64,10 +71,30 @@ public class Snooper : GameWindow
         Renderer.Options.AnimateMesh(false);
         Application.Current.Dispatcher.Invoke(delegate
         {
-            WindowShouldClose(false, false);
+            if (_capturePath != null)
+            {
+                ClientSize = new OpenTK.Mathematics.Vector2i(_captureWidth, _captureHeight);
+                unsafe { GLFW.SetWindowShouldClose(WindowPtr, false); }
+                IsVisible = false;
+            }
+            else
+            {
+                WindowShouldClose(false, false);
+            }
             base.Run();
         });
     }
+
+    public void PrepareCapture(string outputPath, int width, int height)
+    {
+        _capturePath = outputPath;
+        _captureWidth = Math.Clamp(width, 320, 3840);
+        _captureHeight = Math.Clamp(height, 240, 2160);
+        _captureFrames = 0;
+        LastCaptureError = null;
+    }
+
+    public void CancelCapture() => _capturePath = null;
 
     private unsafe void LoadWindowIcon()
     {
@@ -119,7 +146,7 @@ public class Snooper : GameWindow
     protected override void OnRenderFrame(FrameEventArgs args)
     {
         base.OnRenderFrame(args);
-        if (!IsVisible)
+        if (!IsVisible && _capturePath == null)
             return;
 
         ClearWhatHasBeenDrawn(); // clear window background
@@ -132,13 +159,53 @@ public class Snooper : GameWindow
         Framebuffer.Bind(0); // switch to window background
 
         _gui.Render(this); // render UI
+        if (_capturePath != null && ++_captureFrames >= 3)
+        {
+            try
+            {
+                CaptureBackBuffer(_capturePath);
+            }
+            catch (Exception exception)
+            {
+                LastCaptureError = exception.GetBaseException().Message;
+            }
+            finally
+            {
+                _capturePath = null;
+                WindowShouldClose(true, false);
+            }
+        }
         SwapBuffers();
+    }
+
+    private unsafe void CaptureBackBuffer(string outputPath)
+    {
+        var width = ClientSize.X;
+        var height = ClientSize.Y;
+        var pixels = new byte[checked(width * height * 4)];
+        GL.ReadBuffer(ReadBufferMode.Back);
+        fixed (byte* pointer = pixels)
+            GL.ReadPixels(0, 0, width, height, PixelFormat.Rgba, PixelType.UnsignedByte, (IntPtr) pointer);
+
+        var rowLength = width * 4;
+        var row = new byte[rowLength];
+        for (var top = 0; top < height / 2; top++)
+        {
+            var bottom = height - top - 1;
+            System.Buffer.BlockCopy(pixels, top * rowLength, row, 0, rowLength);
+            System.Buffer.BlockCopy(pixels, bottom * rowLength, pixels, top * rowLength, rowLength);
+            System.Buffer.BlockCopy(row, 0, pixels, bottom * rowLength, rowLength);
+        }
+
+        Directory.CreateDirectory(Path.GetDirectoryName(outputPath) ?? throw new InvalidOperationException("Cannot resolve screenshot directory."));
+        using var image = SixLabors.ImageSharp.Image.LoadPixelData<Rgba32>(pixels, width, height);
+        image.SaveAsPng(outputPath);
     }
 
     protected override void OnUpdateFrame(FrameEventArgs e)
     {
         base.OnUpdateFrame(e);
-        if (!IsVisible)
+        if (!IsVisible && _capturePath == null)
             return;
 
         var delta = (float) e.Time;

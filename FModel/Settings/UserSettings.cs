@@ -21,9 +21,9 @@ public sealed class UserSettings : ViewModel
 {
     public static UserSettings Default { get; set; }
 #if DEBUG
-    public static readonly string FilePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "FModel", "AppSettings_Debug.json");
+    public static readonly string FilePath = Environment.GetEnvironmentVariable("FMODEL_SETTINGS_PATH") ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "FModel", "AppSettings_Debug.json");
 #else
-    public static readonly string FilePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "FModel", "AppSettings.json");
+    public static readonly string FilePath = Environment.GetEnvironmentVariable("FMODEL_SETTINGS_PATH") ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "FModel", "AppSettings.json");
 #endif
 
     static UserSettings()
@@ -36,6 +36,7 @@ public sealed class UserSettings : ViewModel
     {
         if (!_bSave || Default == null) return;
         Default.PerDirectory[Default.CurrentDir.GameDirectory] = Default.CurrentDir;
+        Directory.CreateDirectory(Path.GetDirectoryName(FilePath) ?? throw new InvalidOperationException("Cannot resolve settings directory."));
         File.WriteAllText(FilePath, JsonConvert.SerializeObject(Default, Formatting.Indented));
     }
 

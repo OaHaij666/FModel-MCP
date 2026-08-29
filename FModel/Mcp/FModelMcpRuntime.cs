@@ -17,14 +17,29 @@ public sealed class FModelMcpRuntime : IAsyncDisposable
     private readonly SemaphoreSlim _initialization = new(1, 1);
     private readonly SemaphoreSlim _operations = new(1, 1);
     private ApplicationViewModel? _application;
+    public bool IsInitialized => _application != null;
 
     public async Task<T> RunExclusiveAsync<T>(Func<CUE4ParseViewModel, CancellationToken, Task<T>> operation, CancellationToken cancellationToken)
     {
-        await EnsureInitializedAsync(cancellationToken);
         await _operations.WaitAsync(cancellationToken);
         try
         {
+            await EnsureInitializedAsync(cancellationToken);
             return await operation(_application!.CUE4Parse, cancellationToken);
+        }
+        finally
+        {
+            _operations.Release();
+        }
+    }
+
+    public async Task<T> RunSettingsExclusiveAsync<T>(Func<CancellationToken, Task<T>> operation, CancellationToken cancellationToken)
+    {
+        await _operations.WaitAsync(cancellationToken);
+        try
+        {
+            LoadSettings();
+            return await operation(cancellationToken);
         }
         finally
         {
@@ -60,6 +75,15 @@ public sealed class FModelMcpRuntime : IAsyncDisposable
 
     private static void InitializeSettings()
     {
+        LoadSettings();
+        if (UserSettings.Default.CurrentDir != null) return;
+        if (!UserSettings.Default.PerDirectory.TryGetValue(UserSettings.Default.GameDirectory, out var directorySettings))
+            throw new InvalidOperationException("FModel MCP requires a game-directory configuration. Call fmodel_configure_game or configure and open the game once in the GUI.");
+        UserSettings.Default.CurrentDir = directorySettings;
+    }
+
+    private static void LoadSettings()
+    {
         if (UserSettings.Default.OutputDirectory is { Length: > 0 }) return;
         try
         {
@@ -69,10 +93,6 @@ public sealed class FModelMcpRuntime : IAsyncDisposable
         {
             UserSettings.Default = new UserSettings();
         }
-
-        if (!UserSettings.Default.PerDirectory.TryGetValue(UserSettings.Default.GameDirectory, out var directorySettings))
-            throw new InvalidOperationException("FModel MCP requires an existing FModel game-directory configuration. Configure and open the game once in the GUI first.");
-        UserSettings.Default.CurrentDir = directorySettings;
 
         if (string.IsNullOrWhiteSpace(UserSettings.Default.OutputDirectory))
             UserSettings.Default.OutputDirectory = Path.Combine(AppContext.BaseDirectory, "Output");
