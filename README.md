@@ -34,8 +34,11 @@ The server must be restarted after using configuration tools that change the act
 | Tool | Purpose |
 | --- | --- |
 | `fmodel_status` | Mounted archives, asset count, mappings and key readiness (no secrets). |
-| `fmodel_search_assets` | Text or regex search over mounted paths. |
-| `fmodel_get_asset_metadata` | Structured metadata for an asset. |
+| `fmodel_search_assets` | Text/regex search with AND terms, include/exclude wildcards, extension/type filters, cursor pagination, and optional inline export classes. |
+| `fmodel_list_directory` | Navigate a mounted virtual directory and list its direct children. |
+| `fmodel_get_asset_metadata`, `fmodel_get_asset_summary` | Full structured metadata or a compact mesh-oriented summary. |
+| `fmodel_get_asset_dependencies` | Direct package references plus lightweight reverse path-name candidates. |
+| `fmodel_search_content`, `fmodel_find_asset` | Bounded text-content search and an agent-oriented candidate finder. |
 | `fmodel_export_asset`, `fmodel_export_batch` | Export raw data, properties, textures, models, worlds, animations, audio, or code. Per-call export options are supported. |
 | `fmodel_render_preview`, `fmodel_open_asset` | Texture files or hidden-OpenGL model/world preview plus interchange export. |
 | `fmodel_list_game_versions`, `fmodel_configure_game` | Discover and configure game profile settings. |

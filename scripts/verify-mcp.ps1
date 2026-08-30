@@ -28,7 +28,7 @@ try {
     $second = $process.StandardOutput.ReadLineAsync()
     if (!$second.Wait(10000)) { throw "MCP tools/list timed out." }
     $tools = (($second.Result | ConvertFrom-Json).result.tools.name)
-    $expected = "fmodel_status", "fmodel_search_assets", "fmodel_get_asset_metadata", "fmodel_export_asset", "fmodel_export_batch", "fmodel_render_preview", "fmodel_open_asset", "fmodel_list_game_versions", "fmodel_configure_game", "fmodel_set_aes_keys", "fmodel_set_mappings", "fmodel_get_export_options"
+    $expected = "fmodel_status", "fmodel_search_assets", "fmodel_list_directory", "fmodel_get_asset_metadata", "fmodel_get_asset_summary", "fmodel_get_asset_dependencies", "fmodel_search_content", "fmodel_find_asset", "fmodel_export_asset", "fmodel_export_batch", "fmodel_render_preview", "fmodel_open_asset", "fmodel_list_game_versions", "fmodel_configure_game", "fmodel_set_aes_keys", "fmodel_set_mappings", "fmodel_get_export_options"
     if ((Compare-Object $expected $tools)) { throw "Registered MCP tools do not match the expected contract." }
     Write-Host "MCP smoke test passed: $($tools -join ', ')"
 }

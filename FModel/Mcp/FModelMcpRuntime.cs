@@ -1,5 +1,7 @@
 using System;
 using System.IO;
+using System.Collections.Concurrent;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -17,6 +19,7 @@ public sealed class FModelMcpRuntime : IAsyncDisposable
 {
     private readonly SemaphoreSlim _initialization = new(1, 1);
     private readonly SemaphoreSlim _operations = new(1, 1);
+    private readonly ConcurrentDictionary<string, string[]> _assetTypes = new(StringComparer.OrdinalIgnoreCase);
     private bool _settingsLoaded;
     private ApplicationViewModel? _application;
     public bool IsInitialized => _application != null;
@@ -131,6 +134,15 @@ public sealed class FModelMcpRuntime : IAsyncDisposable
         if (string.IsNullOrWhiteSpace(path) || !cue.Provider.Files.TryGetValue(path.Replace('\\', '/'), out var entry))
             throw new FileNotFoundException("The requested FModel asset was not found.", path);
         return entry;
+    }
+
+    public string[] GetAssetTypes(CUE4ParseViewModel cue, GameFile entry)
+    {
+        if (entry.Extension is not ("uasset" or "umap")) return [];
+        return _assetTypes.GetOrAdd(entry.Path, _ => cue.Provider.LoadPackage(entry).GetExports()
+            .Select(export => export.GetType().Name)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray());
     }
 
     public ValueTask DisposeAsync()

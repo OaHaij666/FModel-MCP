@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -16,6 +17,7 @@ using FModel.ViewModels;
 using FModel.ViewModels.ApiEndpoints.Models;
 using ModelContextProtocol.Server;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 namespace FModel.Mcp;
 
@@ -25,6 +27,7 @@ public sealed class FModelMcpTools(FModelMcpRuntime runtime)
     private const int DefaultSearchLimit = 100;
     private const int MaximumSearchLimit = 1_000;
     private const int MaximumBatchSize = 25;
+    private const int MaximumContentCandidates = 2_000;
 
     [McpServerTool(Name = "fmodel_list_game_versions"), Description("List supported CUE4Parse/FModel game and Unreal version identifiers for fmodel_configure_game.")]
     public Task<string> ListGameVersions(string filter = null, int limit = 200, CancellationToken cancellationToken = default)
@@ -134,20 +137,74 @@ public sealed class FModelMcpTools(FModelMcpRuntime runtime)
         [Description("Treat query as a .NET regular expression.")] bool regex = false,
         [Description("Use case-sensitive matching.")] bool caseSensitive = false,
         [Description("Maximum result count, from 1 through 1000.")] int limit = DefaultSearchLimit,
+        [Description("Additional text fragments that must all occur in the path (AND semantics).")]
+        string[] requiredAll = null,
+        [Description("Wildcard path patterns to include. All supplied patterns are ORed.")]
+        string[] includePatterns = null,
+        [Description("Wildcard path patterns to exclude.")]
+        string[] excludePatterns = null,
+        [Description("Extensions to return, for example uasset or umap.")]
+        string[] extensions = null,
+        [Description("Export class names to return, for example UStaticMesh or USkeletalMesh. Type inspection is capped.")]
+        string[] assetTypes = null,
+        [Description("Zero-based result offset. Prefer nextCursor from the previous response.")]
+        int offset = 0,
+        [Description("Opaque numeric cursor returned by the previous response.")]
+        string cursor = null,
+        [Description("Attach export class names to returned uasset/umap entries.")]
+        bool includeAssetTypes = false,
         CancellationToken cancellationToken = default)
         => runtime.RunExclusiveAsync((cue, _) =>
         {
             if (string.IsNullOrWhiteSpace(query)) throw new ArgumentException("query is required.", nameof(query));
             limit = Math.Clamp(limit, 1, MaximumSearchLimit);
+            offset = ParseCursor(cursor, offset);
             var comparison = caseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
             Regex? matcher = regex ? new Regex(query, caseSensitive ? RegexOptions.None : RegexOptions.IgnoreCase, TimeSpan.FromSeconds(2)) : null;
-            var results = cue.Provider.Files.Values
+            var candidates = cue.Provider.Files.Values
                 .Where(file => matcher?.IsMatch(file.Path) ?? file.Path.Contains(query, comparison))
+                .Where(file => (requiredAll ?? []).All(term => !string.IsNullOrWhiteSpace(term) && file.Path.Contains(term, comparison)))
+                .Where(file => MatchesAnyPattern(file.Path, includePatterns, true))
+                .Where(file => !MatchesAnyPattern(file.Path, excludePatterns, false))
+                .Where(file => MatchesExtension(file, extensions))
                 .OrderBy(file => file.Path, StringComparer.OrdinalIgnoreCase)
-                .Take(limit)
-                .Select(file => new { path = file.Path, extension = file.Extension, size = file.Size })
                 .ToArray();
-            return Task.FromResult(JsonConvert.SerializeObject(new { query, regex, count = results.Length, results }, Formatting.Indented));
+            var inspected = 0;
+            var typeFilter = assetTypes?.Where(x => !string.IsNullOrWhiteSpace(x)).ToArray() ?? [];
+            var filtered = candidates.Where(file =>
+            {
+                if (typeFilter.Length == 0) return true;
+                if (inspected++ >= MaximumContentCandidates) return false;
+                try { return runtime.GetAssetTypes(cue, file).Any(type => typeFilter.Contains(type, StringComparer.OrdinalIgnoreCase)); }
+                catch { return false; }
+            });
+            var page = filtered.Skip(offset).Take(limit + 1).ToArray();
+            var hasMore = page.Length > limit;
+            var results = page.Take(limit)
+                .Select(file => BuildSearchResult(cue, file, includeAssetTypes))
+                .ToArray();
+            return Task.FromResult(JsonConvert.SerializeObject(new { query, regex, count = results.Length, offset, nextCursor = hasMore ? (offset + results.Length).ToString() : null, typeInspectionLimited = typeFilter.Length > 0 && inspected >= MaximumContentCandidates, results }, Formatting.Indented));
+        }, cancellationToken);
+
+    [McpServerTool(Name = "fmodel_list_directory"), Description("List direct child files and folders below a mounted virtual directory. Use this after a path search to navigate precisely.")]
+    public Task<string> ListDirectory(string directory, bool recursive = false, string[] extensions = null, int limit = DefaultSearchLimit, int offset = 0, string cursor = null, bool includeAssetTypes = false, CancellationToken cancellationToken = default)
+        => runtime.RunExclusiveAsync((cue, _) =>
+        {
+            if (string.IsNullOrWhiteSpace(directory)) throw new ArgumentException("directory is required.");
+            limit = Math.Clamp(limit, 1, MaximumSearchLimit);
+            offset = ParseCursor(cursor, offset);
+            var normalized = directory.Replace('\\', '/').Trim('/');
+            var prefix = normalized + "/";
+            var entries = cue.Provider.Files.Values.Where(file => file.Path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) && MatchesExtension(file, extensions))
+                .Where(file => recursive || !file.Path[prefix.Length..].Contains('/'))
+                .OrderBy(file => file.Path, StringComparer.OrdinalIgnoreCase).ToArray();
+            var folders = cue.Provider.Files.Values.Where(file => file.Path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                .Select(file => file.Path[prefix.Length..]).Where(relative => relative.Contains('/'))
+                .Select(relative => relative.Split('/')[0]).Where(name => !string.IsNullOrWhiteSpace(name))
+                .Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToArray();
+            var page = entries.Skip(offset).Take(limit + 1).ToArray();
+            var hasMore = page.Length > limit;
+            return Task.FromResult(JsonConvert.SerializeObject(new { directory = normalized, recursive, folders, count = Math.Min(limit, page.Length), offset, nextCursor = hasMore ? (offset + limit).ToString() : null, files = page.Take(limit).Select(file => BuildSearchResult(cue, file, includeAssetTypes)) }, Formatting.Indented));
         }, cancellationToken);
 
     [McpServerTool(Name = "fmodel_get_asset_metadata"), Description("Return FModel's structured metadata for a mounted asset path.")]
@@ -159,6 +216,74 @@ public sealed class FModelMcpTools(FModelMcpRuntime runtime)
                 return Task.FromResult(JsonConvert.SerializeObject(new { path = entry.Path, extension = entry.Extension, size = entry.Size }, Formatting.Indented));
             var result = cue.Provider.GetLoadPackageResult(entry);
             return Task.FromResult(JsonConvert.SerializeObject(result.GetDisplayData(false), Formatting.Indented));
+        }, cancellationToken);
+
+    [McpServerTool(Name = "fmodel_get_asset_summary"), Description("Return a compact asset summary: type, object names, skeleton, materials, LOD/geometry counts where available, and direct path-like references.")]
+    public Task<string> GetAssetSummary(string path, CancellationToken cancellationToken = default)
+        => runtime.RunExclusiveAsync((cue, _) =>
+        {
+            var entry = FModelMcpRuntime.GetFile(cue, path);
+            return Task.FromResult(JsonConvert.SerializeObject(BuildAssetSummary(cue, entry), Formatting.Indented));
+        }, cancellationToken);
+
+    [McpServerTool(Name = "fmodel_get_asset_dependencies"), Description("Return direct path references discovered in an asset package and lightweight reverse path-name matches. This is package-level, not a full AssetRegistry graph.")]
+    public Task<string> GetAssetDependencies(string path, int limit = 100, CancellationToken cancellationToken = default)
+        => runtime.RunExclusiveAsync((cue, _) =>
+        {
+            limit = Math.Clamp(limit, 1, MaximumSearchLimit);
+            var entry = FModelMcpRuntime.GetFile(cue, path);
+            var source = JObject.FromObject(BuildAssetSummary(cue, entry));
+            var name = Path.GetFileNameWithoutExtension(path);
+            var reverse = cue.Provider.Files.Values.Where(file => !file.Path.Equals(path, StringComparison.OrdinalIgnoreCase) && file.Path.Contains(name, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(file => file.Path, StringComparer.OrdinalIgnoreCase).Take(limit).Select(file => new { path = file.Path, extension = file.Extension }).ToArray();
+            return Task.FromResult(JsonConvert.SerializeObject(new { path, direct = source["references"], reversePathNameCandidates = reverse, limitation = "Reverse candidates use mounted path names. Content-level reverse references require game-specific registry or content indexing." }, Formatting.Indented));
+        }, cancellationToken);
+
+    [McpServerTool(Name = "fmodel_search_content"), Description("Search decoded text in a bounded set of mounted text-like files (Lua, INI, JSON, CSV, TXT, string/localization assets). Use extension/include filters to keep it precise.")]
+    public Task<string> SearchContent(string query, string[] extensions = null, string[] includePatterns = null, int maxCandidates = 500, int limit = 100, CancellationToken cancellationToken = default)
+        => runtime.RunExclusiveAsync((cue, _) =>
+        {
+            if (string.IsNullOrWhiteSpace(query)) throw new ArgumentException("query is required.");
+            maxCandidates = Math.Clamp(maxCandidates, 1, MaximumContentCandidates);
+            limit = Math.Clamp(limit, 1, MaximumSearchLimit);
+            var allowed = extensions is { Length: > 0 } ? extensions : ["lua", "luac", "ini", "json", "csv", "txt", "locres", "uasset"];
+            var matches = new List<object>();
+            var scanned = 0;
+            foreach (var file in cue.Provider.Files.Values.Where(file => MatchesExtension(file, allowed) && MatchesAnyPattern(file.Path, includePatterns, true)).OrderBy(file => file.Path, StringComparer.OrdinalIgnoreCase).Take(maxCandidates))
+            {
+                scanned++;
+                try
+                {
+                    using var reader = file.CreateReader();
+                    var bytes = reader.ReadBytes((int)Math.Min(reader.Length, 2_000_000));
+                    var text = Encoding.UTF8.GetString(bytes);
+                    if (!text.Contains(query, StringComparison.OrdinalIgnoreCase)) text = Encoding.Unicode.GetString(bytes);
+                    if (!text.Contains(query, StringComparison.OrdinalIgnoreCase)) continue;
+                    matches.Add(new { path = file.Path, extension = file.Extension, size = file.Size });
+                    if (matches.Count >= limit) break;
+                }
+                catch { /* An unreadable/encrypted candidate is simply not content-searchable. */ }
+            }
+            return Task.FromResult(JsonConvert.SerializeObject(new { query, scannedCandidates = scanned, maxCandidates, count = matches.Count, results = matches, limitation = "Binary localization and proprietary table formats may require game-specific decoding; this tool only searches decodable text." }, Formatting.Indented));
+        }, cancellationToken);
+
+    [McpServerTool(Name = "fmodel_find_asset"), Description("Rank candidate assets from one or more names using AND path matching, optional asset type filtering, and concise type data. Use this as the agent-friendly starting point.")]
+    public Task<string> FindAsset(string[] terms, string[] assetTypes = null, int limit = 50, CancellationToken cancellationToken = default)
+        => runtime.RunExclusiveAsync((cue, _) =>
+        {
+            var normalized = terms?.Where(term => !string.IsNullOrWhiteSpace(term)).Select(term => term.Trim()).ToArray() ?? [];
+            if (normalized.Length == 0) throw new ArgumentException("At least one search term is required.");
+            limit = Math.Clamp(limit, 1, MaximumSearchLimit);
+            var inspected = 0;
+            var candidates = cue.Provider.Files.Values.Where(file => normalized.All(term => file.Path.Contains(term, StringComparison.OrdinalIgnoreCase))).OrderBy(file => file.Path, StringComparer.OrdinalIgnoreCase)
+                .Where(file =>
+                {
+                    if (assetTypes is not { Length: > 0 }) return true;
+                    if (inspected++ >= MaximumContentCandidates) return false;
+                    try { return runtime.GetAssetTypes(cue, file).Any(type => assetTypes.Contains(type, StringComparer.OrdinalIgnoreCase)); }
+                    catch { return false; }
+                }).Take(limit).ToArray();
+            return Task.FromResult(JsonConvert.SerializeObject(new { terms = normalized, assetTypes, count = candidates.Length, candidates = candidates.Select(file => new { confidence = 0.75 + Math.Min(0.2, normalized.Length * 0.05), asset = BuildSearchResult(cue, file, true) }), typeInspectionLimited = assetTypes is { Length: > 0 } && inspected >= MaximumContentCandidates }, Formatting.Indented));
         }, cancellationToken);
 
     [McpServerTool(Name = "fmodel_export_asset"), Description("Export one asset to an absolute local output directory. kind: raw, properties, textures, models, worlds, animations, audio, or code.")]
@@ -389,4 +514,83 @@ public sealed class FModelMcpTools(FModelMcpRuntime runtime)
     private static string[] CaptureDirectories() => [UserSettings.Default.RawDataDirectory, UserSettings.Default.PropertiesDirectory, UserSettings.Default.TextureDirectory, UserSettings.Default.AudioDirectory, UserSettings.Default.CodeDirectory, UserSettings.Default.ModelDirectory];
     private static void SetDirectories(string value) => (UserSettings.Default.RawDataDirectory, UserSettings.Default.PropertiesDirectory, UserSettings.Default.TextureDirectory, UserSettings.Default.AudioDirectory, UserSettings.Default.CodeDirectory, UserSettings.Default.ModelDirectory) = (value, value, value, value, value, value);
     private static void RestoreDirectories(string[] values) => (UserSettings.Default.RawDataDirectory, UserSettings.Default.PropertiesDirectory, UserSettings.Default.TextureDirectory, UserSettings.Default.AudioDirectory, UserSettings.Default.CodeDirectory, UserSettings.Default.ModelDirectory) = (values[0], values[1], values[2], values[3], values[4], values[5]);
+
+    private object BuildSearchResult(CUE4ParseViewModel cue, GameFile file, bool includeAssetTypes)
+    {
+        string[] types = null;
+        if (includeAssetTypes && file.Extension is "uasset" or "umap")
+        {
+            try { types = runtime.GetAssetTypes(cue, file); }
+            catch { types = []; }
+        }
+        return new { path = file.Path, extension = file.Extension, size = file.Size, assetTypes = types };
+    }
+
+    private object BuildAssetSummary(CUE4ParseViewModel cue, GameFile entry)
+    {
+        if (entry.Extension is not ("uasset" or "umap")) return new { path = entry.Path, extension = entry.Extension, size = entry.Size, assetTypes = Array.Empty<string>() };
+        var exports = cue.Provider.LoadPackage(entry).GetExports().ToArray();
+        var serialized = JsonConvert.SerializeObject(exports, Formatting.None);
+        var references = Regex.Matches(serialized, @"(?:[A-Za-z0-9_]+/)+(?:Content|Plugins)/[^\""\\]+", RegexOptions.IgnoreCase)
+            .Select(match => Regex.Replace(match.Value.Replace('\\', '/'), @"\.\d+$", string.Empty)).Distinct(StringComparer.OrdinalIgnoreCase).Take(200).ToArray();
+        return new
+        {
+            path = entry.Path,
+            assetTypes = exports.Select(export => export.GetType().Name).Distinct().ToArray(),
+            objectNames = exports.Select(export => export.Name).Take(100).ToArray(),
+            skeleton = ReadProperty(exports, "Skeleton"),
+            materialSlots = ReadProperty(exports, "StaticMaterials", "Materials"),
+            lodCount = CountProperty(exports, "LODInfo", "LODs", "ImportedModel"),
+            vertexCount = ReadProperty(exports, "NumVertices"),
+            triangleCount = ReadProperty(exports, "NumTriangles"),
+            references
+        };
+    }
+
+    private static int ParseCursor(string cursor, int offset)
+        => !string.IsNullOrWhiteSpace(cursor) && int.TryParse(cursor, out var parsed) ? Math.Max(0, parsed) : Math.Max(0, offset);
+
+    private static bool MatchesExtension(GameFile file, IEnumerable<string> extensions)
+    {
+        var values = extensions?.Where(value => !string.IsNullOrWhiteSpace(value)).Select(value => value.Trim().TrimStart('.')).ToArray() ?? [];
+        return values.Length == 0 || values.Contains(file.Extension, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static bool MatchesAnyPattern(string path, IEnumerable<string> patterns, bool defaultWhenEmpty)
+    {
+        var values = patterns?.Where(value => !string.IsNullOrWhiteSpace(value)).ToArray() ?? [];
+        if (values.Length == 0) return defaultWhenEmpty;
+        return values.Any(pattern => Regex.IsMatch(path, "^" + Regex.Escape(pattern.Trim()).Replace("\\*", ".*").Replace("\\?", ".") + "$", RegexOptions.IgnoreCase, TimeSpan.FromSeconds(1)));
+    }
+
+    private static object ReadProperty(IEnumerable<object> exports, params string[] names)
+    {
+        foreach (var export in exports)
+        foreach (var name in names)
+        {
+            var property = export.GetType().GetProperty(name);
+            if (property?.GetValue(export) is { } value) return FormatValue(value);
+        }
+        return null;
+    }
+
+    private static object FormatValue(object value)
+    {
+        if (value is string) return value;
+        if (value is System.Collections.IEnumerable enumerable)
+            return enumerable.Cast<object>().Select(item => item?.ToString()).Where(item => item != null).Take(100).ToArray();
+        return value.ToString();
+    }
+
+    private static int? CountProperty(IEnumerable<object> exports, params string[] names)
+    {
+        foreach (var export in exports)
+        foreach (var name in names)
+        {
+            var property = export.GetType().GetProperty(name);
+            if (property?.GetValue(export) is System.Collections.ICollection collection) return collection.Count;
+            if (property?.GetValue(export) is System.Collections.IEnumerable enumerable) return enumerable.Cast<object>().Count();
+        }
+        return null;
+    }
 }
