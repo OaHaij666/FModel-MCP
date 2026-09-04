@@ -33,6 +33,11 @@ try {
     Write-Host "MCP smoke test passed: $($tools -join ', ')"
 }
 finally {
-    if (!$process.HasExited) { $process.Kill($true) }
+    # Kill(bool) only exists on PowerShell 7 / .NET 6+; Windows PowerShell 5.1 has Kill() and ErrorsData.
+    if (!$process.HasExited) {
+        try { $method = $process.GetType().GetMethod("Kill", [type[]]@([bool]))
+              if ($method) { $process.Kill($true) } else { $process.Kill() } }
+        catch { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+    }
     $process.Dispose()
 }

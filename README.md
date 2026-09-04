@@ -33,13 +33,13 @@ The server must be restarted after using configuration tools that change the act
 
 | Tool | Purpose |
 | --- | --- |
-| `fmodel_status` | Mounted archives, asset count, mappings and key readiness (no secrets). |
+| `fmodel_status` | Mounted archives, asset count, mappings and key readiness, native-capability state, and an explicit `limitations` list (no secrets). |
 | `fmodel_search_assets` | Text/regex search with AND terms, include/exclude wildcards, extension/type filters, cursor pagination, and optional inline export classes. |
 | `fmodel_list_directory` | Navigate a mounted virtual directory and list its direct children. |
 | `fmodel_get_asset_metadata`, `fmodel_get_asset_summary` | Full structured metadata or a compact mesh-oriented summary. |
 | `fmodel_get_asset_dependencies` | Direct package references plus lightweight reverse path-name candidates. |
 | `fmodel_search_content`, `fmodel_find_asset` | Bounded text-content search and an agent-oriented candidate finder. |
-| `fmodel_export_asset`, `fmodel_export_batch` | Export raw data, properties, textures, models, worlds, animations, audio, or code. Per-call export options are supported. |
+| `fmodel_export_asset`, `fmodel_export_batch` | Export raw data, properties, textures, models, worlds, animations, audio, or code. Per-call export options, an optional `subdirectory` to keep kinds apart, and `relativePaths` for compact responses. |
 | `fmodel_render_preview`, `fmodel_open_asset` | Texture files or hidden-OpenGL model/world preview plus interchange export. |
 | `fmodel_list_game_versions`, `fmodel_configure_game` | Discover and configure game profile settings. |
 | `fmodel_set_aes_keys`, `fmodel_set_mappings` | Configure keys and mappings without returning secret values. |
@@ -47,12 +47,34 @@ The server must be restarted after using configuration tools that change the act
 
 For example, an agent can search `Dalang`, choose the static-mesh `.uasset`, then call `fmodel_export_asset` with `kind: "models"` and `options: { "meshFormat": "Gltf2" }` to produce a `.glb` file.
 
+### Result and error contract
+
+The MCP transport collapses thrown tool exceptions into a fixed `An error occurred invoking 'x'.` notice, so expected failures are returned as data instead of thrown:
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "name_matches_but_path_differs",
+    "message": "'.../S999/Mesh/SK_Weap_M82_206.uasset' is not mounted, but 4 mounted file(s) are named 'SK_Weap_M82_206'."
+    "hint": "The folder is most likely wrong. Retry with one of candidates, or call fmodel_find_asset with the bare asset name.",
+    "candidates": [".../S206/Mesh/SK_Weap_M82_206.uasset", "..."]
+  }
+}
+```
+
+- Asset paths are resolved leniently: omitting `.uasset`, or pointing at a `.uexp`/`.ubulk` companion, resolves to the real package and reports `resolution: "resolved_with_normalization"`.
+- Export results separate `files` (everything produced), `writtenFiles` (newly created), and `overwrittenFiles` (pre-existing files rewritten by this batch). Overwriting is reported, never silent, and does not flip `ok`.
+- Every batch item carries `code`, the underlying .NET exception text, and matched advice, so a format rejection is no longer indistinguishable from a decode failure.
+- Different `kind` values can write the same filename. Notably `kind: "properties"` dumps the raw property tree while a `kind: "models"` export writes a richer material description, both as `<name>.json`. Give each kind its own `subdirectory` to keep them apart.
+- `fmodel_status.limitations` lists conditions that degrade output without erroring: missing mappings, missing `CUE4Parse-Natives`, and archives still mounting.
 ## Requirements and limitations
 
 - Windows x64 and .NET 10 are required for building. Published self-contained binaries do not need a separate .NET install.
 - Users must only configure game files, AES keys, and mappings they are authorized to access.
 - Model/world screenshots require a working local OpenGL/GPU driver. Failure to capture a screenshot does not prevent model/world export.
 - `FModel.Mcp.exe` serializes operations because the underlying FModel provider is mutable and WPF-bound.
+- Animation export needs the optional `CUE4Parse-Natives` library and a format that supports it (`ActorX`, `UEFormat`, or `USD`; not `Gltf2`). The library is built by CMake during compilation and is skipped silently when CMake or a C++ toolchain is unavailable, which `fmodel_status` then reports as `nativesLoaded: false`.
 
 ## Upstream FModel
 

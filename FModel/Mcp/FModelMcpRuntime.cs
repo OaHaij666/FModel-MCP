@@ -103,8 +103,11 @@ public sealed class FModelMcpRuntime : IAsyncDisposable
             UserSettings.Default = JsonConvert.DeserializeObject<UserSettings>(
                 File.ReadAllText(UserSettings.FilePath), JsonNetSerializer.SerializerSettings) ?? new UserSettings();
         }
-        catch
+        catch (Exception exception)
         {
+            // A swallowed parse failure silently resets every setting, which then surfaces as a
+            // misleading "no game-directory configuration" error from InitializeSettings().
+            Console.Error.WriteLine($"FModel MCP could not parse {UserSettings.FilePath} ({exception.GetType().Name}: {exception.Message}). Falling back to default settings; existing values are not lost on disk.");
             UserSettings.Default = new UserSettings();
         }
 

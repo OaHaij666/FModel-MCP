@@ -117,7 +117,7 @@ public sealed class FModelMcpTools(FModelMcpRuntime runtime)
             }, Formatting.Indented));
         }, cancellationToken);
 
-    [McpServerTool(Name = "fmodel_status"), Description("Report FModel archive mounting and readiness without exposing game paths or keys.")]
+    [McpServerTool(Name = "fmodel_status"), Description("Report FModel archive mounting, readiness, and optional native capabilities without exposing game paths or keys. Read nativesLoaded and mappingsLoaded before attempting animation or property-heavy exports.")]
     public Task<string> Status(CancellationToken cancellationToken)
         => runtime.RunExclusiveAsync((cue, _) => Task.FromResult(JsonConvert.SerializeObject(new
         {
@@ -128,7 +128,9 @@ public sealed class FModelMcpTools(FModelMcpRuntime runtime)
             assetCount = cue.Provider.Files.Count,
             requiredKeyCount = cue.Provider.RequiredKeys.Count,
             configuredKeyCount = cue.Provider.Keys.Count,
-            mappingsLoaded = cue.Provider.MappingsContainer != null
+            mappingsLoaded = cue.Provider.MappingsContainer != null,
+            nativesLoaded = CUE4Parse.Utils.CUE4ParseNatives.IsInitialized,
+            limitations = FModelMcpDiagnostics.ActiveLimitations(cue)
         }, Formatting.Indented)), cancellationToken);
 
     [McpServerTool(Name = "fmodel_search_assets"), Description("Search mounted FModel asset paths. Results are capped at 1000 entries.")]
@@ -208,22 +210,49 @@ public sealed class FModelMcpTools(FModelMcpRuntime runtime)
         }, cancellationToken);
 
     [McpServerTool(Name = "fmodel_get_asset_metadata"), Description("Return FModel's structured metadata for a mounted asset path.")]
-    public Task<string> GetAssetMetadata([Description("Exact mounted asset path.")] string path, CancellationToken cancellationToken = default)
+    public Task<string> GetAssetMetadata([Description("Exact mounted asset path, or the same path without its .uasset extension.")] string path, CancellationToken cancellationToken = default)
         => runtime.RunExclusiveAsync((cue, _) =>
         {
-            var entry = FModelMcpRuntime.GetFile(cue, path);
+            var lookup = FModelMcpDiagnostics.ResolveFile(cue, path);
+            if (!lookup.Found) return Task.FromResult(FModelMcpDiagnostics.FromLookup(lookup, "fmodel_get_asset_metadata"));
+            var entry = lookup.Entry;
             if (entry.Extension is not ("uasset" or "umap"))
                 return Task.FromResult(JsonConvert.SerializeObject(new { path = entry.Path, extension = entry.Extension, size = entry.Size }, Formatting.Indented));
-            var result = cue.Provider.GetLoadPackageResult(entry);
-            return Task.FromResult(JsonConvert.SerializeObject(result.GetDisplayData(false), Formatting.Indented));
+            try
+            {
+                var result = cue.Provider.GetLoadPackageResult(entry);
+                return Task.FromResult(JsonConvert.SerializeObject(result.GetDisplayData(false), Formatting.Indented));
+            }
+            catch (Exception exception)
+            {
+                var mappings = cue.Provider.MappingsContainer != null;
+                return Task.FromResult(FModelMcpDiagnostics.Error(
+                    FModelMcpDiagnostics.Classify(exception, mappings),
+                    FModelMcpDiagnostics.Describe(exception, $"Metadata could not be read for '{entry.Path}'"),
+                    FModelMcpDiagnostics.MappingsHint("metadata", mappings),
+                    [entry.Path]));
+            }
         }, cancellationToken);
 
     [McpServerTool(Name = "fmodel_get_asset_summary"), Description("Return a compact asset summary: type, object names, skeleton, materials, LOD/geometry counts where available, and direct path-like references.")]
     public Task<string> GetAssetSummary(string path, CancellationToken cancellationToken = default)
         => runtime.RunExclusiveAsync((cue, _) =>
         {
-            var entry = FModelMcpRuntime.GetFile(cue, path);
-            return Task.FromResult(JsonConvert.SerializeObject(BuildAssetSummary(cue, entry), Formatting.Indented));
+            var lookup = FModelMcpDiagnostics.ResolveFile(cue, path);
+            if (!lookup.Found) return Task.FromResult(FModelMcpDiagnostics.FromLookup(lookup, "fmodel_get_asset_summary"));
+            try
+            {
+                return Task.FromResult(JsonConvert.SerializeObject(BuildAssetSummary(cue, lookup.Entry), Formatting.Indented));
+            }
+            catch (Exception exception)
+            {
+                var mappings = cue.Provider.MappingsContainer != null;
+                return Task.FromResult(FModelMcpDiagnostics.Error(
+                    FModelMcpDiagnostics.Classify(exception, mappings),
+                    FModelMcpDiagnostics.Describe(exception, $"Summary could not be built for '{lookup.Entry.Path}'"),
+                    FModelMcpDiagnostics.MappingsHint("summary", mappings),
+                    [lookup.Entry.Path]));
+            }
         }, cancellationToken);
 
     [McpServerTool(Name = "fmodel_get_asset_dependencies"), Description("Return direct path references discovered in an asset package and lightweight reverse path-name matches. This is package-level, not a full AssetRegistry graph.")]
@@ -231,12 +260,24 @@ public sealed class FModelMcpTools(FModelMcpRuntime runtime)
         => runtime.RunExclusiveAsync((cue, _) =>
         {
             limit = Math.Clamp(limit, 1, MaximumSearchLimit);
-            var entry = FModelMcpRuntime.GetFile(cue, path);
-            var source = JObject.FromObject(BuildAssetSummary(cue, entry));
-            var name = Path.GetFileNameWithoutExtension(path);
-            var reverse = cue.Provider.Files.Values.Where(file => !file.Path.Equals(path, StringComparison.OrdinalIgnoreCase) && file.Path.Contains(name, StringComparison.OrdinalIgnoreCase))
+            var lookup = FModelMcpDiagnostics.ResolveFile(cue, path);
+            if (!lookup.Found) return Task.FromResult(FModelMcpDiagnostics.FromLookup(lookup, "fmodel_get_asset_dependencies"));
+            var entry = lookup.Entry;
+            JObject source;
+            try { source = JObject.FromObject(BuildAssetSummary(cue, entry)); }
+            catch (Exception exception)
+            {
+                var mappings = cue.Provider.MappingsContainer != null;
+                return Task.FromResult(FModelMcpDiagnostics.Error(
+                    FModelMcpDiagnostics.Classify(exception, mappings),
+                    FModelMcpDiagnostics.Describe(exception, $"Dependencies could not be read for '{entry.Path}'"),
+                    FModelMcpDiagnostics.MappingsHint("dependencies", mappings),
+                    [entry.Path]));
+            }
+            var name = Path.GetFileNameWithoutExtension(entry.Name);
+            var reverse = cue.Provider.Files.Values.Where(file => !file.Path.Equals(entry.Path, StringComparison.OrdinalIgnoreCase) && file.Path.Contains(name, StringComparison.OrdinalIgnoreCase))
                 .OrderBy(file => file.Path, StringComparer.OrdinalIgnoreCase).Take(limit).Select(file => new { path = file.Path, extension = file.Extension }).ToArray();
-            return Task.FromResult(JsonConvert.SerializeObject(new { path, direct = source["references"], reversePathNameCandidates = reverse, limitation = "Reverse candidates use mounted path names. Content-level reverse references require game-specific registry or content indexing." }, Formatting.Indented));
+            return Task.FromResult(JsonConvert.SerializeObject(new { path = entry.Path, direct = source["references"], reversePathNameCandidates = reverse, limitation = "Reverse candidates use mounted path names. Content-level reverse references require game-specific registry or content indexing." }, Formatting.Indented));
         }, cancellationToken);
 
     [McpServerTool(Name = "fmodel_search_content"), Description("Search decoded text in a bounded set of mounted text-like files (Lua, INI, JSON, CSV, TXT, string/localization assets). Use extension/include filters to keep it precise.")]
@@ -287,25 +328,45 @@ public sealed class FModelMcpTools(FModelMcpRuntime runtime)
         }, cancellationToken);
 
     [McpServerTool(Name = "fmodel_export_asset"), Description("Export one asset to an absolute local output directory. kind: raw, properties, textures, models, worlds, animations, audio, or code.")]
-    public Task<string> ExportAsset(string path, string kind, string outputDirectory, McpExportOptions options = null, CancellationToken cancellationToken = default)
-        => runtime.RunExclusiveAsync((cue, ct) => ExportAsync(cue, new[] { path }, kind, outputDirectory, options, ct), cancellationToken);
+    public Task<string> ExportAsset(
+        string path,
+        string kind,
+        string outputDirectory,
+        McpExportOptions options = null,
+        [Description("Optional folder below outputDirectory. Give each export kind its own subdirectory so a property dump cannot overwrite the richer material description written by a model export.")]
+        string subdirectory = null,
+        [Description("Return file paths relative to outputDirectory to keep large batches readable.")]
+        bool relativePaths = false,
+        CancellationToken cancellationToken = default)
+        => runtime.RunExclusiveAsync((cue, ct) => ExportAsync(cue, new[] { path }, kind, outputDirectory, options, ct, subdirectory, relativePaths), cancellationToken);
 
-    [McpServerTool(Name = "fmodel_export_batch"), Description("Export up to 25 assets to an absolute local output directory. Each item reports its result.")]
-    public Task<string> ExportBatch(string[] paths, string kind, string outputDirectory, McpExportOptions options = null, CancellationToken cancellationToken = default)
+    [McpServerTool(Name = "fmodel_export_batch"), Description("Export up to 25 assets to an absolute local output directory. Reports produced files, newly written files, overwritten files, and per-item failure reasons instead of a bare success flag.")]
+    public Task<string> ExportBatch(
+        string[] paths,
+        string kind,
+        string outputDirectory,
+        McpExportOptions options = null,
+        [Description("Optional folder below outputDirectory. Give each export kind its own subdirectory so a property dump cannot overwrite the richer material description written by a model export.")]
+        string subdirectory = null,
+        [Description("Return file paths relative to outputDirectory to keep large batches readable.")]
+        bool relativePaths = false,
+        CancellationToken cancellationToken = default)
         => runtime.RunExclusiveAsync((cue, ct) =>
         {
             if (paths is null || paths.Length == 0) throw new ArgumentException("At least one asset path is required.", nameof(paths));
             if (paths.Length > MaximumBatchSize) throw new ArgumentOutOfRangeException(nameof(paths), $"A batch may contain at most {MaximumBatchSize} assets.");
-            return ExportAsync(cue, paths, kind, outputDirectory, options, ct);
+            return ExportAsync(cue, paths, kind, outputDirectory, options, ct, subdirectory, relativePaths);
         }, cancellationToken);
 
     [McpServerTool(Name = "fmodel_render_preview"), Description("Export a texture PNG/WebP or model/world interchange data. 3D screenshot availability depends on the local OpenGL driver.")]
     public Task<string> RenderPreview(string path, string outputDirectory, int width = 1280, int height = 720, CancellationToken cancellationToken = default)
         => runtime.RunExclusiveAsync(async (cue, ct) =>
         {
-            var entry = FModelMcpRuntime.GetFile(cue, path);
+            var lookup = FModelMcpDiagnostics.ResolveFile(cue, path);
+            if (!lookup.Found) return FModelMcpDiagnostics.FromLookup(lookup, "fmodel_render_preview");
+            var entry = lookup.Entry;
             var previewKind = ResolvePreviewExportKind(cue, entry);
-            var result = await ExportAsync(cue, new[] { path }, previewKind, outputDirectory, null, ct);
+            var result = await ExportAsync(cue, new[] { entry.Path }, previewKind, outputDirectory, null, ct);
             string screenshot = null;
             string screenshotStatus;
             string screenshotReason = null;
@@ -382,45 +443,136 @@ public sealed class FModelMcpTools(FModelMcpRuntime runtime)
         return "textures";
     }
 
-    private static async Task<string> ExportAsync(CUE4ParseViewModel cue, IReadOnlyCollection<string> paths, string kind, string outputDirectory, McpExportOptions options, CancellationToken cancellationToken)
+    private static async Task<string> ExportAsync(CUE4ParseViewModel cue, IReadOnlyCollection<string> paths, string kind, string outputDirectory, McpExportOptions options, CancellationToken cancellationToken, string subdirectory = null, bool relativePaths = false)
     {
-        var fullOutputDirectory = ValidateOutputDirectory(outputDirectory);
+        var fullOutputDirectory = ValidateOutputDirectory(outputDirectory, subdirectory);
         var bulk = ParseBulkKind(kind);
+        var mappingsLoaded = cue.Provider.MappingsContainer != null;
+
+        string Show(string file)
+        {
+            if (!relativePaths || !Path.IsPathRooted(file)) return file;
+            var relative = Path.GetRelativePath(fullOutputDirectory, file);
+            return relative.Length == 0 || relative.StartsWith("..", StringComparison.Ordinal) ? file : relative;
+        }
+
+        static DateTime Stamp(string file)
+        {
+            try { return File.GetLastWriteTimeUtc(file); }
+            catch (IOException) { return DateTime.MinValue; }
+        }
 
         var original = CaptureDirectories();
         try
         {
             SetDirectories(fullOutputDirectory);
             var before = Directory.EnumerateFiles(fullOutputDirectory, "*", SearchOption.AllDirectories)
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                .GroupBy(file => file, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(group => group.Key, group => Stamp(group.First()), StringComparer.OrdinalIgnoreCase);
             var queued = new ExportSession();
             cue.ExportSessionOverride = queued;
-            var results = new List<object>();
+            var requests = new List<object>();
+            var rejected = new List<object>();
+
             foreach (var path in paths)
             {
+                var lookup = FModelMcpDiagnostics.ResolveFile(cue, path);
+                if (!lookup.Found)
+                {
+                    rejected.Add(new { requestedPath = path, code = lookup.Code, message = lookup.Message, hint = lookup.Hint, candidates = lookup.Candidates });
+                    continue;
+                }
+
                 try
                 {
-                    var entry = FModelMcpRuntime.GetFile(cue, path);
-                    if (bulk is EBulkType.Raw)
-                        cue.ExportData(entry);
-                    else
-                        cue.Extract(cancellationToken, entry, false, bulk | EBulkType.Auto);
-                    results.Add(new { path = entry.Path, queued = true });
+                    if (bulk is EBulkType.Raw) cue.ExportData(lookup.Entry);
+                    else cue.Extract(cancellationToken, lookup.Entry, false, bulk | EBulkType.Auto);
+                    requests.Add(new { requestedPath = path, path = lookup.Entry.Path, resolution = lookup.Code });
                 }
-                catch (Exception)
+                catch (Exception exception)
                 {
-                    results.Add(new { path, success = false, error = "The asset could not be prepared for export." });
+                    rejected.Add(new
+                    {
+                        requestedPath = path,
+                        path = lookup.Entry.Path,
+                        code = FModelMcpDiagnostics.Classify(exception, mappingsLoaded),
+                        message = FModelMcpDiagnostics.Describe(exception, "The asset could not be queued for export"),
+                        hint = FModelMcpDiagnostics.HintFor(FModelMcpDiagnostics.Classify(exception, mappingsLoaded), kind, mappingsLoaded),
+                    });
                 }
             }
+
             IReadOnlyList<ExportResult> exportResults = queued.HasQueuedItems
                 ? await queued.RunAsync(fullOutputDirectory, options?.Build() ?? UserSettings.GetExportOptions(), ct: cancellationToken)
                 : [];
-            var completed = exportResults.Select(x => new { path = x.ObjectPath, success = x.Success, error = x.Success ? null : "The exporter reported a failure." }).ToArray();
-            var writtenFiles = Directory.EnumerateFiles(fullOutputDirectory, "*", SearchOption.AllDirectories)
-                .Where(path => !before.Contains(path))
-                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-            return JsonConvert.SerializeObject(new { kind = bulk.ToString(), outputDirectory = fullOutputDirectory, writtenFiles, queued = results, completed }, Formatting.Indented);
+
+            var succeeded = 0;
+            var failed = 0;
+            var reported = new List<string>();
+            var completed = new List<object>();
+            foreach (var result in exportResults)
+            {
+                if (result.Success) succeeded++;
+                else failed++;
+
+                var diskFiles = (result.DiskFilePaths ?? [])
+                    .Select(file => Path.IsPathRooted(file) ? Path.GetFullPath(file) : Path.GetFullPath(Path.Combine(fullOutputDirectory, file)))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+                foreach (var file in diskFiles)
+                    if (!reported.Contains(file, StringComparer.OrdinalIgnoreCase)) reported.Add(file);
+
+                var error = result.Error;
+                completed.Add(new
+                {
+                    path = result.ObjectPath,
+                    success = result.Success,
+                    code = result.Success || error is null ? null : FModelMcpDiagnostics.Classify(error, mappingsLoaded),
+                    error = result.Success ? null : (error is null ? "The exporter reported a failure without an exception." : FModelMcpDiagnostics.Describe(error)),
+                    hint = result.Success ? null : FModelMcpDiagnostics.HintFor(FModelMcpDiagnostics.Classify(error, mappingsLoaded), kind, mappingsLoaded),
+                    files = diskFiles.Select(Show).ToArray(),
+                });
+            }
+
+            // ExportResult.DiskFilePaths is only populated by some exporters, so the directory scan is
+            // the completeness backstop and `unreportedByExporter` keeps that gap observable. Timestamps
+            // are compared against the pre-run value because a rewritten file never appears as "new".
+            var after = Directory.EnumerateFiles(fullOutputDirectory, "*", SearchOption.AllDirectories).ToArray();
+            var newFiles = after.Where(file => !before.ContainsKey(file)).ToArray();
+            var rewritten = after.Where(file => before.TryGetValue(file, out var stamp) && Stamp(file) > stamp).ToArray();
+
+            var produced = new List<string>();
+            foreach (var file in newFiles.Concat(rewritten).Concat(reported).Where(file => !string.IsNullOrEmpty(file)))
+                if (!produced.Contains(file, StringComparer.OrdinalIgnoreCase)) produced.Add(file);
+
+            var touched = newFiles.Concat(rewritten).ToArray();
+            var unreported = touched.Where(file => !reported.Contains(file, StringComparer.OrdinalIgnoreCase)).ToArray();
+            var overwritten = rewritten.Concat(reported.Where(before.ContainsKey)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+
+            return JsonConvert.SerializeObject(new
+            {
+                kind = bulk.ToString(),
+                outputDirectory = fullOutputDirectory,
+                ok = rejected.Count == 0 && failed == 0 && requests.Count > 0,
+                requested = paths.Count,
+                summary = new
+                {
+                    queued = requests.Count,
+                    rejected = rejected.Count,
+                    succeeded,
+                    failed,
+                    producedFiles = produced.Count,
+                    newFiles = newFiles.Length,
+                    overwrittenFiles = overwritten.Length,
+                    unreportedByExporter = unreported.Length,
+                },
+                queued = requests,
+                rejected,
+                completed,
+                files = produced.Select(Show).ToArray(),
+                writtenFiles = newFiles.Select(Show).ToArray(),
+                overwrittenFiles = overwritten.Select(Show).ToArray(),
+            }, Formatting.Indented);
         }
         finally
         {
@@ -441,15 +593,27 @@ public sealed class FModelMcpTools(FModelMcpRuntime runtime)
         return bulk;
     }
 
-    private static string ValidateOutputDirectory(string outputDirectory)
+    private static string ValidateOutputDirectory(string outputDirectory, string subdirectory = null)
     {
         if (string.IsNullOrWhiteSpace(outputDirectory) || !Path.IsPathFullyQualified(outputDirectory))
             throw new ArgumentException("outputDirectory must be an absolute path.", nameof(outputDirectory));
         var fullPath = Path.GetFullPath(outputDirectory);
+        if (!string.IsNullOrWhiteSpace(subdirectory))
+        {
+            var segments = subdirectory.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+            foreach (var segment in segments)
+                if (segment is "." or ".." || Path.IsPathRooted(segment) || segment.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+                    throw new ArgumentException($"subdirectory must stay inside outputDirectory, but '{subdirectory}' does not.", nameof(subdirectory));
+            var combined = Path.GetFullPath(Path.Combine(new[] { fullPath }.Concat(segments).ToArray()));
+            var prefix = fullPath.EndsWith(Path.DirectorySeparatorChar.ToString()) ? fullPath : fullPath + Path.DirectorySeparatorChar;
+            if (!combined.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                throw new ArgumentException("subdirectory resolved outside outputDirectory.", nameof(subdirectory));
+            fullPath = combined;
+        }
         try { Directory.CreateDirectory(fullPath); }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or NotSupportedException)
         {
-            throw new ArgumentException("outputDirectory cannot be created or written.", nameof(outputDirectory));
+            throw new ArgumentException($"outputDirectory cannot be created or written: {exception.Message}", nameof(outputDirectory));
         }
         return fullPath;
     }
