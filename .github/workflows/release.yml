@@ -1,0 +1,205 @@
+name: Release
+
+# Publishing happens here rather than on a workstation on purpose. CUE4Parse-Natives is compiled by
+# CMake during the build, and the MSBuild target prints "CUE4Parse-Natives build failed. Continuing
+# without it." and keeps going. A binary built on a machine without CMake + MSVC therefore ships
+# without ACL support and cannot decode compressed animations at all, with nothing in the build log
+# to show for it. This workflow builds the natives explicitly and fails when they are missing.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, for example 1.3.0. Defaults to the tag."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and publish (win-x64)
+    runs-on: windows-latest
+
+    env:
+      FRAMEWORK: net10.0-windows
+      RID: win-x64
+
+    steps:
+      - name: Checkout with every nested submodule
+        uses: actions/checkout@v4
+        with:
+          # ACL sits three levels down: CUE4Parse -> CUE4Parse-Natives -> ACL/external/acl.
+          # The CMake gate is "if(EXISTS .../acl/includes)", so an incomplete submodule tree
+          # produces a library that compiles fine and still cannot decompress animations.
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: .NET 10 setup
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Require the ACL sources before compiling anything
+        shell: pwsh
+        run: |
+          $needed = @(
+            "CUE4Parse/CUE4Parse-Natives/ACL/external/acl/includes",
+            "CUE4Parse/CUE4Parse-Natives/ACL/external/acl/external/rtm/includes"
+          )
+          foreach ($p in $needed) {
+            if (-not (Test-Path $p)) {
+              Write-Host "::error::Missing $p. The submodule tree was not fetched, so CUE4Parse-Natives would build WITHOUT ACL and animation export would stay unsupported."
+              exit 1
+            }
+          }
+          Write-Host "ACL and RTM headers present; WITH_ACL will be enabled."
+
+      - name: Confirm the C++ toolchain is present
+        shell: pwsh
+        run: |
+          cmake --version | Select-Object -First 1
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            Write-Host "::error::vswhere not found, so this runner has no C++ toolchain and the natives cannot be built."
+            exit 1
+          }
+          & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+
+      - name: Restore
+        shell: pwsh
+        run: dotnet restore "./FModel/FModel.slnx" -r $env:RID
+
+      - name: Build CUE4Parse-Natives
+        shell: pwsh
+        run: |
+          $src = (Resolve-Path "CUE4Parse/CUE4Parse-Natives").Path
+          $build = Join-Path $src "build-ci"
+          New-Item -ItemType Directory -Force -Path $build | Out-Null
+          Push-Location $build
+          try {
+            cmake $src
+            if ($LASTEXITCODE -ne 0) { throw "CMake configure failed." }
+            cmake --build . --config Release --target install
+            if ($LASTEXITCODE -ne 0) { throw "CMake build failed." }
+          } finally {
+            Pop-Location
+          }
+          $dll = Join-Path $src "bin/Release/CUE4Parse-Natives.dll"
+          if (-not (Test-Path $dll)) {
+            Write-Host "::error::Expected $dll after the natives build. Refusing to publish a binary that cannot decode animations."
+            exit 1
+          }
+          Write-Host ("Built CUE4Parse-Natives.dll ({0:N1} KB)" -f ((Get-Item $dll).Length / 1KB))
+
+      - name: Publish the MCP server
+        shell: pwsh
+        run: |
+          # IncludeNativeLibrariesForSelfExtract is only set for FModel.csproj, and project properties
+          # do not flow into the referencing project, so the single-file MCP host must pass it itself.
+          dotnet publish "./FModel.Mcp/FModel.Mcp.csproj" -c Release -r $env:RID --self-contained true `
+            -f $env:FRAMEWORK --no-restore -o "./out/mcp" `
+            -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:DebugType=None -p:DebugSymbols=false -p:GenerateDocumentationFile=false
+
+      - name: Publish the GUI
+        shell: pwsh
+        run: |
+          dotnet publish "./FModel/FModel.csproj" -c Release -r $env:RID --self-contained true `
+            -f $env:FRAMEWORK --no-restore -o "./out/gui" `
+            -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:DebugType=None -p:DebugSymbols=false -p:GenerateDocumentationFile=false
+
+      - name: Check the natives actually reached the published binaries
+        id: natives
+        shell: pwsh
+        run: |
+          # Accept either outcome, because whether a native asset ends up inside the single-file
+          # bundle depends on how it was published. A loose DLL is still fatal unless it ships in
+          # the archive, so the payload step below copies loose natives in when that happens.
+          $loose = @(Get-ChildItem "./out" -Recurse -Filter "CUE4Parse-Natives.dll" -File)
+          $ok = $true
+          foreach ($exe in @("./out/mcp/FModel.Mcp.exe", "./out/gui/FModel.exe")) {
+            $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Resolve-Path $exe)))
+            $embedded = $text.IndexOf("CUE4Parse-Natives.dll", [StringComparison]::Ordinal) -ge 0
+            Write-Host ("{0}: embedded={1} looseFiles={2}" -f $exe, $embedded, $loose.Count)
+            if (-not $embedded -and $loose.Count -eq 0) { $ok = $false }
+          }
+          if (-not $ok) {
+            Write-Host "::error::CUE4Parse-Natives.dll is in neither the bundles nor the publish output. Animation export would fail at runtime even though the build reported success."
+            exit 1
+          }
+          "looseCount=$($loose.Count)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding ascii -Append
+
+      - name: Verify the MCP contract
+        shell: pwsh
+        run: |
+          ./scripts/verify-mcp.ps1 -Executable "./out/mcp/FModel.Mcp.exe"
+          ./scripts/verify-mcp.ps1 -Executable "./out/gui/FModel.exe"
+
+      - name: Assemble release payload
+        id: payload
+        shell: pwsh
+        env:
+          MANUAL_VERSION: ${{ github.event.inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          # workflow_dispatch reports the branch rather than a tag, so the two triggers have to be
+          # derived apart or the version can end up as "1.3.0main".
+          if ($env:MANUAL_VERSION) {
+            $version = $env:MANUAL_VERSION -replace "^v", ""
+            $tag = "v$version"
+          } elseif ($env:REF_NAME -like "v*") {
+            $tag = $env:REF_NAME
+            $version = $tag -replace "^v", ""
+          } else {
+            $version = "0.0.0-" + $env:GITHUB_SHA.Substring(0, 7)
+            $tag = "v$version"
+          }
+          "TAG=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding ascii -Append
+          "ZIP=FModel-MCP-v$version-win-x64.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding ascii -Append
+
+          New-Item -ItemType Directory -Force -Path "./stage" | Out-Null
+          Copy-Item "./out/gui/FModel.exe" "./stage/FModel.exe" -Force
+          Copy-Item "./out/mcp/FModel.Mcp.exe" "./stage/FModel.Mcp.exe" -Force
+
+          # If the natives were not folded into the single-file bundles they must sit next to the
+          # executables in the archive, or every published copy loses animation support again.
+          foreach ($native in (Get-ChildItem "./out" -Recurse -Filter "CUE4Parse-Natives*.dll" -File)) {
+            Copy-Item $native.FullName (Join-Path "./stage" $native.Name) -Force
+            Write-Host ("staged loose native: " + $native.Name)
+          }
+
+          # Checksums describe the executables inside the archive, matching the published v1.1.0 file.
+          Get-ChildItem "./stage" -File | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+            "$hash  $($_.Name)"
+          } | Set-Content -LiteralPath "./stage/SHA256SUMS.txt" -Encoding ascii
+
+          Compress-Archive -Path (Get-ChildItem "./stage" -File | Where-Object Name -ne "SHA256SUMS.txt").FullName `
+            -DestinationPath "./FModel-MCP-v$version-win-x64.zip" -CompressionLevel Optimal
+          Get-Content "./stage/SHA256SUMS.txt"
+
+      - name: Create or update the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.payload.outputs.TAG }}
+          ZIP: ${{ steps.payload.outputs.ZIP }}
+        run: |
+          $notes = if (Test-Path "./RELEASE_NOTES.md") { "./RELEASE_NOTES.md" } else { $null }
+          $assets = @($env:ZIP, "./stage/SHA256SUMS.txt")
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release edit $env:TAG --draft=false --latest
+            gh release upload $env:TAG --clobber @assets
+          } elseif ($notes) {
+            gh release create $env:TAG --draft=false --latest --title "FModel MCP $env:TAG" --notes-file $notes @assets
+          } else {
+            gh release create $env:TAG --draft=false --latest --title "FModel MCP $env:TAG" --generate-notes @assets
+          }
+          gh release view $env:TAG
