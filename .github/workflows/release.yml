@@ -101,8 +101,11 @@ jobs:
         run: |
           # IncludeNativeLibrariesForSelfExtract is only set for FModel.csproj, and project properties
           # do not flow into the referencing project, so the single-file MCP host must pass it itself.
+          # PublishDir rather than -o: the SDK rejects --output for single-file projects (NETSDK1194)
+          # and -o also drops loose content next to the wrong root.
           dotnet publish "./FModel.Mcp/FModel.Mcp.csproj" -c Release -r $env:RID --self-contained true `
-            -f $env:FRAMEWORK --no-restore -o "./out/mcp" `
+            -f $env:FRAMEWORK --no-restore `
+            -p:PublishDir="$(Join-Path $PWD 'out\mcp\')" `
             -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
             -p:DebugType=None -p:DebugSymbols=false -p:GenerateDocumentationFile=false
 
@@ -110,7 +113,8 @@ jobs:
         shell: pwsh
         run: |
           dotnet publish "./FModel/FModel.csproj" -c Release -r $env:RID --self-contained true `
-            -f $env:FRAMEWORK --no-restore -o "./out/gui" `
+            -f $env:FRAMEWORK --no-restore `
+            -p:PublishDir="$(Join-Path $PWD 'out\gui\')" `
             -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
             -p:DebugType=None -p:DebugSymbols=false -p:GenerateDocumentationFile=false
 
